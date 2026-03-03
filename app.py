@@ -3,51 +3,97 @@ import json
 import io
 import re
 import zipfile
+import base64
+import urllib.parse
+import unicodedata
 import docx
 from docx import Document
 from docx.shared import Inches
 
+# --- TERMINAL-LOGGNING ---
+def log(msg):
+    print(f"[LOGG] {msg}")
+
 # --- HJÄLPFUNKTIONER ---
 
 def add_hyperlink(paragraph, text, url):
-    """Skapar en klickbar länk i Word."""
-    part = paragraph.part
-    r_id = part.relate_to(url, docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
-    hyperlink = docx.oxml.shared.OxmlElement('w:hyperlink')
-    hyperlink.set(docx.oxml.shared.qn('r:id'), r_id)
-    new_run = docx.oxml.shared.OxmlElement('w:r')
-    rPr = docx.oxml.shared.OxmlElement('w:rPr')
-    c = docx.oxml.shared.OxmlElement('w:color')
-    c.set(docx.oxml.shared.qn('w:val'), "0000FF")
-    rPr.append(c)
-    u = docx.oxml.shared.OxmlElement('w:u')
-    u.set(docx.oxml.shared.qn('w:val'), 'single')
-    rPr.append(u)
-    new_run.append(rPr)
-    t = docx.oxml.shared.OxmlElement('w:t')
-    t.text = text
-    new_run.append(t)
-    hyperlink.append(new_run)
-    paragraph._p.append(hyperlink)
+    """Skapar en klickbar blå länk i Word-dokumentet."""
+    try:
+        part = paragraph.part
+        r_id = part.relate_to(url, docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+        hyperlink = docx.oxml.shared.OxmlElement('w:hyperlink')
+        hyperlink.set(docx.oxml.shared.qn('r:id'), r_id)
+        new_run = docx.oxml.shared.OxmlElement('w:r')
+        rPr = docx.oxml.shared.OxmlElement('w:rPr')
+        c = docx.oxml.shared.OxmlElement('w:color')
+        c.set(docx.oxml.shared.qn('w:val'), "0000FF")
+        rPr.append(c)
+        u = docx.oxml.shared.OxmlElement('w:u')
+        u.set(docx.oxml.shared.qn('w:val'), 'single')
+        rPr.append(u)
+        new_run.append(rPr)
+        t = docx.oxml.shared.OxmlElement('w:t')
+        t.text = text
+        new_run.append(t)
+        hyperlink.append(new_run)
+        paragraph._p.append(hyperlink)
+    except Exception:
+        paragraph.add_run(f"{text} ({url})")
 
 def normalize(name):
-    """Tvättar filnamn för matchning."""
-    clean = name.replace('\xa0', ' ').replace('□', ' ')
-    return re.sub(r'[^a-zA-Z0-9]', '', clean).lower()
+    """Normaliserar filnamn för matchning."""
+    if not name: return ""
+    n = unicodedata.normalize('NFD', name)
+    n = "".join([c for c in n if unicodedata.category(c) != 'Mn']).lower()
+    n = n.replace('\xa0', ' ').replace('□', ' ')
+    return re.sub(r'[^a-z0-9]', '', n)
 
-def find_image_in_uploads(target_name, uploaded_images):
-    """Letar bild bland uppladdningar."""
-    target_norm = normalize(target_name)
-    for original_path, file_obj in uploaded_images.items():
-        if target_norm in normalize(original_path):
+def find_image_in_uploads(target_name, target_id, uploaded_images):
+    """Letar efter bild via namn eller Box-ID."""
+    t_name_norm = normalize(target_name)
+    t_id_str = str(target_id) if target_id else None
+
+    for path, file_obj in uploaded_images.items():
+        if t_id_str and t_id_str in path:
+            return file_obj
+        if t_name_norm and t_name_norm in normalize(path):
             return file_obj
     return None
 
-def process_node_list(nodes, doc_obj, paragraph_obj, uploaded_images, warnings, note_name):
-    """Huvudparser för den moderna BoxNote-strukturen."""
+def extract_unique_legacy_images(pool):
+    """Extraherar unika bilder och deras Box-länkar från poolen."""
+    unique_images = {}
+    if not pool or 'numToAttrib' not in pool:
+        return []
+    
+    for attr in pool['numToAttrib'].values():
+        val = attr[0] if isinstance(attr, list) else str(attr)
+        if val.startswith('image-'):
+            try:
+                parts = val.split('-')
+                if len(parts) >= 3:
+                    encoded_part = parts[-1]
+                    padding = len(encoded_part) % 4
+                    if padding: encoded_part += '=' * (4 - padding)
+                    
+                    decoded = base64.b64decode(urllib.parse.unquote(encoded_part)).decode('utf-8')
+                    info = json.loads(urllib.parse.unquote(decoded))
+                    
+                    fname = info.get('fileName', 'image.png')
+                    fid = info.get('boxFileId') or info.get('fileId')
+                    flink = info.get('boxSharedLink') # Länken vi vill ha!
+                    
+                    name_key = normalize(fname)
+                    if name_key not in unique_images:
+                        unique_images[name_key] = {'name': fname, 'id': fid, 'link': flink}
+            except Exception: pass
+    return list(unique_images.values())
+
+def process_node_list(nodes, doc_obj, paragraph_obj, uploaded_images, note_name):
+    """Parser för det moderna formatet. Returnerar True om bilder saknas."""
+    missing_any = False
     for node in nodes:
         n_type = node.get('type')
-        
         if n_type == 'text':
             text = node.get('text', '')
             marks = node.get('marks', [])
@@ -57,85 +103,81 @@ def process_node_list(nodes, doc_obj, paragraph_obj, uploaded_images, warnings, 
             else:
                 run = paragraph_obj.add_run(text)
                 if any(m['type'] == 'strong' for m in marks): run.bold = True
-                    
         elif n_type == 'image':
-            img_fn = node.get('attrs', {}).get('fileName')
-            if img_fn:
-                img_data = find_image_in_uploads(img_fn, uploaded_images)
-                if img_data:
-                    # Vi skapar en kopia av datan för att inte stänga strömmen
-                    img_bytes = io.BytesIO(img_data.getvalue())
-                    doc_obj.add_picture(img_bytes, width=Inches(5.5))
-                else:
-                    warnings.append(f"Saknas: {img_fn} i {note_name}")
-
+            attrs = node.get('attrs', {})
+            img = find_image_in_uploads(attrs.get('fileName'), attrs.get('boxFileId'), uploaded_images)
+            if img:
+                doc_obj.add_picture(io.BytesIO(img.getvalue()), width=Inches(5.5))
+            else:
+                p = doc_obj.add_paragraph("[BILD SAKNAS LOKALT] ")
+                # Moderna noter har sällan direktlänkar inbäddade på samma sätt,
+                # men vi skriver ut filnamnet så man vet vad man letar efter.
+                p.add_run(f"Filnamn: {attrs.get('fileName')}").italic = True
+                missing_any = True
         elif n_type in ['paragraph', 'heading']:
             level = node.get('attrs', {}).get('level', 0) if n_type == 'heading' else 0
             p = doc_obj.add_heading('', level=level) if level > 0 else doc_obj.add_paragraph()
             if 'content' in node:
-                process_content_recursive(node['content'], doc_obj, p, uploaded_images, warnings, note_name)
-
-        elif n_type in ['bullet_list', 'ordered_list']:
-            for item in node.get('content', []): # list_item
-                for sub in item.get('content', []):
-                    p = doc_obj.add_paragraph(style='List Bullet')
-                    process_content_recursive(sub.get('content', []), doc_obj, p, uploaded_images, warnings, note_name)
-
-def process_content_recursive(content, doc_obj, p_obj, images, warnings, name):
-    """Hjälpfunktion för rekursion."""
-    if content:
-        process_node_list(content, doc_obj, p_obj, images, warnings, name)
+                if process_node_list(node['content'], doc_obj, p, uploaded_images, note_name):
+                    missing_any = True
+    return missing_any
 
 # --- APP ---
-
-st.set_page_config(page_title="BoxNote Pro", page_icon="📝")
+st.set_page_config(page_title="BoxNote Pro", layout="centered")
 st.title("📝 BoxNote Pro-konverterare")
 
-files = st.file_uploader("Dra in .boxnote och bildmapp (eller bilder)", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Dra in filer här", accept_multiple_files=True)
 
-if files:
-    notes = [f for f in files if f.name.endswith('.boxnote')]
-    imgs = {f.name: f for f in files if f.name.lower().endswith(('.png', '.jpg', '.jpeg'))}
+if uploaded_files:
+    notes = [f for f in uploaded_files if f.name.endswith('.boxnote')]
+    imgs = {f.name: f for f in uploaded_files if f.name.lower().endswith(('.png', '.jpg', '.jpeg'))}
     
-    if notes and st.button(f"Konvertera {len(notes)} filer"):
+    if notes and st.button(f"Konvertera {len(notes)} noter"):
         zip_buf = io.BytesIO()
-        all_warns = []
 
-        with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zip_f:
+        with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zip_file:
             for n_file in notes:
+                log(f"Bearbetar: {n_file.name}")
                 try:
-                    raw_data = json.loads(n_file.getvalue().decode("utf-8"))
+                    data = json.loads(n_file.getvalue().decode("utf-8"))
                     doc = Document()
+                    missing_images = False
                     
-                    # Logik för olika JSON-versioner
-                    processed = False
+                    # 1. MODERN
+                    if 'doc' in data:
+                        missing_images = process_node_list(data['doc'].get('content', []), doc, None, imgs, n_file.name)
                     
-                    # Version A: Modern (doc -> content)
-                    if 'doc' in raw_data:
-                        process_node_list(raw_data['doc'].get('content', []), doc, None, imgs, all_warns, n_file.name)
-                        processed = True
-                    
-                    # Version B: Gammal (ate -> text)
-                    elif 'ate' in raw_data and 'text' in raw_data['ate']:
-                        doc.add_heading(n_file.name, 0)
-                        for line in raw_data['ate']['text'].split('\n'):
+                    # 2. LEGACY
+                    elif 'atext' in data:
+                        doc.add_heading(n_file.name.replace(".boxnote", ""), 0)
+                        for line in data['atext'].get('text', '').split('\n'):
                             doc.add_paragraph(line)
-                        processed = True
+                        
+                        legacy_imgs = extract_unique_legacy_images(data.get('pool', {}))
+                        if legacy_imgs:
+                            doc.add_heading("Bifogade bilder", level=2)
+                            for info in legacy_imgs:
+                                img_data = find_image_in_uploads(info['name'], info['id'], imgs)
+                                if img_data:
+                                    doc.add_picture(io.BytesIO(img_data.getvalue()), width=Inches(5.5))
+                                else:
+                                    missing_images = True
+                                    p = doc.add_paragraph(f"⚠️ Bild saknas: {info['name']} - ")
+                                    if info['link']:
+                                        add_hyperlink(p, "KLICKA HÄR FÖR ATT SE BILDEN PÅ BOX", info['link'])
+                                    else:
+                                        p.add_run("(Ingen direktlänk hittades)")
 
-                    if not processed:
-                        st.error(f"Kunde inte tolka formatet i: {n_file.name}")
-                        st.write(f"Hittade nycklar: {list(raw_data.keys())}")
-                    else:
-                        d_buf = io.BytesIO()
-                        doc.save(d_buf)
-                        zip_f.writestr(n_file.name.replace(".boxnote", ".docx"), d_buf.getvalue())
-
+                    # Spara filnamn med markering om något saknas
+                    base_name = n_file.name.replace(".boxnote", ".docx")
+                    final_name = f"[FIXA] {base_name}" if missing_images else base_name
+                    
+                    d_io = io.BytesIO()
+                    doc.save(d_io)
+                    zip_file.writestr(final_name, d_io.getvalue())
+                    
                 except Exception as e:
                     st.error(f"Fel vid {n_file.name}: {e}")
 
-        if all_warns:
-            with st.expander("Saknade bilder"):
-                for w in all_warns: st.warning(w)
-
-        st.success("Konvertering klar!")
-        st.download_button("📥 Ladda ner Word-filer (ZIP)", zip_buf.getvalue(), "boxnotes_export.zip")
+        st.success("Klar! Filer som saknar bilder är markerade med [FIXA].")
+        st.download_button("📥 Ladda ner ZIP", zip_buf.getvalue(), "box_export.zip")
